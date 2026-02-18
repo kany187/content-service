@@ -8,6 +8,7 @@ fastapi = {extras = ["standard"], version = "*"}
 openai = "*"
 python-dotenv = "*"
 pydantic = "*"
+google-cloud-firestore = "*"
 
 [dev-packages]
 

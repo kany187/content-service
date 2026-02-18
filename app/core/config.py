@@ -12,6 +12,7 @@ if _env_path.exists():
 
 class Settings(BaseSettings):
     OPENAI_API_KEY: str
+    GOOGLE_CLOUD_PROJECT: str = "biso-event"
 
     model_config = _model_config
 
