@@ -131,7 +131,7 @@ Event: {data.title}
 Category: {data.category}{city_part}{venue_part}
 
 Return a JSON object with exactly these keys:
-- description: 80-400 character captivating description for the event
+- description: 80-400 character captivating description for the event. Include 2-4 relevant emojis (e.g. 🎵 for concert, ⚽ for sports) to make it engaging.
 - tags: array of 5-8 lowercase tags (e.g. ["concert", "live music", "kinshasa"])
 - suggestedVenue: a plausible venue name if not provided, or null if venue was given
 - refundPolicy: 80-150 word refund policy template
