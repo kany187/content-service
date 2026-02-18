@@ -4,12 +4,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.core.config import settings
-from app.routes import generate, recommend
+from app.routes import chat, generate, recommend
 
 app = FastAPI(title='AI Content Service')
 
 app.include_router(generate.router)
 app.include_router(recommend.router)
+app.include_router(chat.router)
 
 
 @app.on_event("startup")
