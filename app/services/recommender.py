@@ -4,6 +4,7 @@ Uses userInterestProfiles (AI & personalization) and eventAnalytics (trending).
 Falls back to trending when user has no profile.
 """
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -13,6 +14,83 @@ logger = logging.getLogger(__name__)
 
 MAX_RECOMMENDATIONS = 10
 MAX_CANDIDATES = 100
+
+# Geographic re-ranking: events within DISTANCE_BONUS_RADIUS_KM get a bonus
+# inversely proportional to distance, capped at DISTANCE_BONUS_MAX.
+DISTANCE_BONUS_MAX = 5.0
+DISTANCE_BONUS_RADIUS_KM = 20.0
+
+
+def _coerce_user_coords(lat: Any, lng: Any) -> tuple[float, float] | None:
+    """
+    Validate user GPS coords. Both must be finite floats and in valid lat/lng
+    bounds. If either is missing or invalid, returns None (the caller silently
+    drops the geographic bonus rather than erroring).
+    """
+    if lat is None or lng is None:
+        return None
+    try:
+        lat_f = float(lat)
+        lng_f = float(lng)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(lat_f) and math.isfinite(lng_f)):
+        return None
+    if not (-90.0 <= lat_f <= 90.0 and -180.0 <= lng_f <= 180.0):
+        return None
+    return (lat_f, lng_f)
+
+
+def _extract_event_coords(event: dict) -> tuple[float, float] | None:
+    """
+    Read finite (lat, lng) from event['venueCoordinates']. Supports a plain
+    dict {lat, lng} (the documented shape) and a Firestore GeoPoint as a
+    defensive fallback. Returns None for any other shape so the event is
+    skipped from the distance bonus without being penalized.
+    """
+    coords = event.get("venueCoordinates")
+    if coords is None:
+        return None
+
+    if isinstance(coords, dict):
+        lat = coords.get("lat")
+        lng = coords.get("lng")
+    elif hasattr(coords, "latitude") and hasattr(coords, "longitude"):
+        # Firestore GeoPoint
+        lat = coords.latitude
+        lng = coords.longitude
+    else:
+        return None
+
+    if lat is None or lng is None:
+        return None
+    try:
+        lat_f = float(lat)
+        lng_f = float(lng)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(lat_f) and math.isfinite(lng_f)):
+        return None
+    return (lat_f, lng_f)
+
+
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Great-circle distance in km between two (lat, lng) points."""
+    earth_radius_km = 6371.0088
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return earth_radius_km * c
+
+
+def _distance_bonus(distance_km: float) -> float:
+    """5 * max(0, 1 - min(distanceKm, 20) / 20). Zero past 20km, max at 0km."""
+    return DISTANCE_BONUS_MAX * max(
+        0.0, 1.0 - min(distance_km, DISTANCE_BONUS_RADIUS_KM) / DISTANCE_BONUS_RADIUS_KM
+    )
 
 
 def _serialize_doc(doc: Any) -> dict | None:
@@ -163,12 +241,21 @@ def score_event_trending(event: dict, analytics: dict[str, dict]) -> float:
     return views * 0.1 + favorites * 2 + shares * 1.5 + conversion * 10
 
 
-def recommend_events(user_id: str | None = None, limit: int = MAX_RECOMMENDATIONS) -> dict:
+def recommend_events(
+    user_id: str | None = None,
+    limit: int = MAX_RECOMMENDATIONS,
+    user_lat: Any = None,
+    user_lng: Any = None,
+) -> dict:
     """
     Get personalized or trending event recommendations.
     - If user_id and userInterestProfiles exists: score by topCategories, topCities, pricePreference
     - Else: use eventAnalytics (trending)
     - Excludes past events
+    - If valid user_lat / user_lng are provided AND the event has finite
+      venueCoordinates.lat/lng, adds a small distance bonus (max +5 at 0km,
+      0 past 20km) and includes distanceKm on the response item. Events
+      without venue coords keep their pre-distance score (no penalty).
     """
     events = get_upcoming_events(limit=MAX_CANDIDATES)
     if not events:
@@ -176,47 +263,57 @@ def recommend_events(user_id: str | None = None, limit: int = MAX_RECOMMENDATION
 
     profile = get_user_interest_profile(user_id) if user_id else None
     analytics = get_event_analytics([e.get("id") for e in events if e.get("id")])
+    user_coords = _coerce_user_coords(user_lat, user_lng)
 
     # Filter past events
     now = datetime.now(timezone.utc)
     events = [e for e in events if (_parse_event_date(e) or now) >= now]
 
-    if profile and (profile.get("topCategories") or profile.get("topCities")):
-        # Personalized scoring
-        scored = [
-            (e, score_event_with_profile(e, profile))
-            for e in events
-        ]
-        # Sort by score desc, then by date asc (soonest first)
-        def _sort_key(item):
-            e, s = item
-            d = _parse_event_date(e)
-            ts = d.timestamp() if d else float("inf")
-            return (s, -ts)  # higher score first; same score -> sooner date first
+    # Per-event distance: None when we can't compute it (no user coords or no
+    # event coords). Stored in a side map keyed by id() so we don't mutate the
+    # event dict before scoring.
+    distances: dict[int, float] = {}
+    if user_coords is not None:
+        u_lat, u_lng = user_coords
+        for e in events:
+            ev_coords = _extract_event_coords(e)
+            if ev_coords is None:
+                continue
+            distances[id(e)] = _haversine_km(u_lat, u_lng, ev_coords[0], ev_coords[1])
 
-        scored.sort(key=_sort_key, reverse=True)
+    def _bonus_for(e: dict) -> float:
+        d = distances.get(id(e))
+        return _distance_bonus(d) if d is not None else 0.0
+
+    if profile and (profile.get("topCategories") or profile.get("topCities")):
+        # Personalized scoring + distance bonus
+        scored = [(e, score_event_with_profile(e, profile) + _bonus_for(e)) for e in events]
         source = "personalized"
     else:
-        # Trending fallback (secondary sort by date when no analytics)
-        scored = [
-            (e, score_event_trending(e, analytics))
-            for e in events
-        ]
-
-        def _sort_key(item):
-            e, s = item
-            d = _parse_event_date(e)
-            ts = d.timestamp() if d else float("inf")
-            return (s, -ts)
-
-        scored.sort(key=_sort_key, reverse=True)
+        # Trending fallback + distance bonus
+        scored = [(e, score_event_trending(e, analytics) + _bonus_for(e)) for e in events]
         source = "trending"
+
+    # Sort by score desc, then by date asc (soonest first)
+    def _sort_key(item):
+        e, s = item
+        d = _parse_event_date(e)
+        ts = d.timestamp() if d else float("inf")
+        return (s, -ts)
+
+    scored.sort(key=_sort_key, reverse=True)
 
     # Take top N, serialize for response
     recommended = [e for e, _ in scored[:limit]]
-    out = [
-        _serialize_value({**e, "id": e.get("id")})
-        for e in recommended
-    ]
+    out: list[dict] = []
+    for e in recommended:
+        item = _serialize_value({**e, "id": e.get("id")})
+        d = distances.get(id(e))
+        # Only include distanceKm when we actually computed it; events without
+        # venue coords (or when user coords were absent/invalid) get no field
+        # rather than a misleading null.
+        if d is not None:
+            item["distanceKm"] = round(d, 2)
+        out.append(item)
 
     return {"events": out, "source": source}
